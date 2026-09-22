@@ -1,0 +1,5 @@
+.env
+menu_stock.json
+__pycache__/
+*.pyc
+.venv/
