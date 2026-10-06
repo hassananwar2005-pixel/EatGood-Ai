@@ -5,7 +5,13 @@ Flow:
   get_user_input -> extract_order (LLM) -> order_confirm -> cook -> serve -> finish_success
                         |                       |            |       |
                         |                       v            v       v
-                        +<---- ask_user <-------+       finish_failure (apology) -> END
+                        +<---- ask_user -------+       finish_failure (apology) -> END
+ 
+CHANGE (multi-dish cart): an order is now a list of items ("2 biryani, 3 naan") instead
+of a single dish. order_details = {"items": [{"dish_name", "required_quantity",
+"available_quantity"}, ...]}. The graph structure/routing is unchanged -- only the node
+internals (extract_order, order_confirm, ask_user, cook, serve, finish_success,
+finish_failure) and the Extraction model changed to carry a list of items.
  
 Install:  pip install langgraph groq pydantic
 Run:      python restaurant_order_agent.py
@@ -29,7 +35,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
  
 # ------------------------------------------------------------------ settings
 MENU = {                      # dish -> quantity in stock after each restock (edit these numbers)
@@ -115,7 +121,7 @@ SERVE_RETRIES = 2
 MAX_ERRORS = 3                # errors in a row before we close the order
 COOK_SUCCESS_PROB = 0.6       # 60% success, 40% fail
 SERVE_SUCCESS_PROB = 0.6      # you did not say, so same as cook
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 USE_LLM_FOR_MESSAGES = True   # False = always use the plain text templates
 VERBOSE = True                # print a [node] line for every step
 QUIET = False                 # True (web server): do not print the conversation to the console
@@ -134,10 +140,15 @@ def roll(kind: str) -> bool:
  
  
 # ------------------------------------------------------------------ state
-class OrderDetails(TypedDict):
+class CartItem(TypedDict):
     dish_name: str
     required_quantity: int
     available_quantity: int   # written by order_confirm
+    status: str                # "ok" / "partial" / "out" -- written by order_confirm
+ 
+ 
+class OrderDetails(TypedDict):
+    items: list                # list[CartItem] -- a cart, so an order can hold several dishes
  
  
 class UserProfile(TypedDict):
@@ -166,7 +177,7 @@ class OrderState(TypedDict):
 def new_state() -> OrderState:
     return {
         "messages": [AIMessage(content=WELCOME)],
-        "order_details": {"dish_name": "", "required_quantity": 0, "available_quantity": 0},
+        "order_details": {"items": []},
         "user_profile": {"allergies": [], "unverified": [], "notes": []},
         "status": "PENDING",
         "order_retries": ORDER_RETRIES,
@@ -196,35 +207,9 @@ NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
  
  
-class Extraction(BaseModel):
-    intent: Literal["order", "confirm", "reject", "recommend", "profile", "unrelated"] = "unrelated"
-    dish: str | None = None
+class OrderItem(BaseModel):
+    dish: str = ""
     quantity: int | None = None
-    multiple: bool = False             # True when the customer names several dishes
-    allergies: list[str] = []          # foods the customer says they are allergic to / cannot eat
- 
-    @model_validator(mode="before")
-    @classmethod
-    def tolerate_llm_shapes(cls, data):
-        """The LLM may return several dishes (a list) or an unknown intent. Never crash on that."""
-        if not isinstance(data, dict):
-            return data
-        data = dict(data)
-        multi = bool(data.get("multiple"))
-        for key in ("dish", "quantity"):
-            if isinstance(data.get(key), (list, tuple)):
-                items = list(data[key])
-                if len(items) > 1:
-                    multi = True
-                data[key] = items[0] if len(items) == 1 else None
-        if isinstance(data.get("dish"), str) and re.search(r",|&|;|\band\b|\+", data["dish"].lower()):
-            multi, data["dish"] = True, None
-        if isinstance(data.get("items"), list) and len(data["items"]) > 1:
-            multi = True
-        if data.get("intent") not in ("order", "confirm", "reject", "recommend", "profile", "unrelated"):
-            data["intent"] = "unrelated"
-        data["multiple"] = multi
-        return data
  
     @field_validator("quantity", mode="before")
     @classmethod
@@ -236,6 +221,12 @@ class Extraction(BaseModel):
         except (TypeError, ValueError):
             return None
         return v if v > 0 else None
+ 
+ 
+class Extraction(BaseModel):
+    intent: Literal["order", "confirm", "reject", "recommend", "profile", "unrelated"] = "unrelated"
+    items: list[OrderItem] = []        # every dish+quantity mentioned (an order can have several)
+    allergies: list[str] = []          # foods the customer says they are allergic to / cannot eat
  
     @field_validator("allergies", mode="before")
     @classmethod
@@ -250,12 +241,15 @@ class Extraction(BaseModel):
  
  
 EXTRACT_PROMPT = """You read ONE message from a restaurant customer and reply with JSON only:
-{"intent": "order" | "confirm" | "reject" | "recommend" | "profile" | "unrelated", "dish": <string or null>, "quantity": <integer or null>, "allergies": [<strings>], "multiple": <true or false>}
+{"intent": "order" | "confirm" | "reject" | "recommend" | "profile" | "unrelated", "items": [{"dish": <string>, "quantity": <integer>}], "allergies": [<strings>]}
  
-- "order": the customer wants a dish. dish = the dish name in singular (e.g. "pizza"). quantity = how many, or null if not said.
-- "multiple": true when the customer asks for MORE THAN ONE different dish in the message (then set dish and quantity to null). Otherwise false.
-- "confirm": the customer agrees to go ahead with the partial order (for example "yes", "ok go ahead"). Use it only when awaiting_confirmation is true.
-- "reject": the customer says no / does not want that, and does not name a new dish.
+- "order": the customer wants one or more dishes. items = a list with one entry per dish mentioned,
+  dish name in singular (e.g. "pizza"), quantity = how many of that dish. If a dish has no quantity
+  stated, omit that item from the list rather than guessing a number. A message can name several
+  dishes at once (e.g. "2 biryani and 3 naan") -- list every one of them.
+- "confirm": the customer agrees to go ahead with the available items (for example "yes", "ok go ahead").
+  Use it only when awaiting_confirmation is true. items = [].
+- "reject": the customer says no / does not want that, and does not name a new dish. items = [].
 - "recommend": the customer asks what to eat or asks for suggestions.
 - "profile": the message ONLY tells us about the customer's allergies or foods they cannot eat (no order, no question).
 - "unrelated": anything else that is not about ordering food (questions, chit-chat, other tasks).
@@ -283,6 +277,8 @@ _RECOMMEND_RE = re.compile(
     r"surprise me|what do you have|any ideas)\b")
 _STOP_WORDS = {"please", "pls", "thanks", "thank", "ok", "okay", "so", "but", "what", "which", "you", "it",
                "this", "that", "any", "all", "some", "something", "anything", "very", "highly", "severely"}
+_ITEM_SPLIT_RE = re.compile(r",|\band\b|&|\bplus\b|\balso\b")      # splits "2 naan and 3 biryani" into pieces
+_ITEM_RE = re.compile(r"\b(\d+|" + "|".join(NUMBER_WORDS) + r")\s+([a-z][a-z ]*)")
  
  
 def _allergy_words(t: str) -> tuple[list[str], str]:
@@ -310,16 +306,38 @@ def _allergy_words(t: str) -> tuple[list[str], str]:
     return words, cleaned
  
  
+def _extract_items_rule(t_clean: str) -> list[dict]:
+    """Finds every '<qty> <dish>' piece, splitting on commas / 'and' / '&' / 'plus' / 'also'
+    so one message can order several dishes at once, e.g. '2 biryani, 3 naan and 1 lassi'."""
+    items: list[dict] = []
+    seen: set[str] = set()
+    for segment in _ITEM_SPLIT_RE.split(t_clean):
+        segment = segment.strip()
+        if not segment:
+            continue
+        m = _ITEM_RE.search(segment)
+        if not m:
+            continue
+        qty_raw, dish_raw = m.group(1), m.group(2)
+        qty = NUMBER_WORDS.get(qty_raw, qty_raw)
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            continue
+        dish = _normalize_dish(dish_raw)
+        if qty > 0 and dish and dish not in seen:
+            items.append({"dish": dish, "quantity": qty})
+            seen.add(dish)
+    return items
+ 
+ 
 def extract_with_rules(text: str) -> Extraction:
     """Fallback when there is no Groq key (or the LLM fails)."""
     t = text.strip().lower()
     allergies, t_clean = _allergy_words(t)
-    words = "|".join(NUMBER_WORDS)
-    m = re.search(rf"\b(\d+|{words})\s+([a-z][a-z ]*)", t_clean)
-    if m:
-        qty = m.group(1)
-        return Extraction(intent="order", dish=_normalize_dish(m.group(2)),
-                          quantity=NUMBER_WORDS.get(qty, qty), allergies=allergies)
+    items = _extract_items_rule(t_clean)
+    if items:
+        return Extraction(intent="order", items=items, allergies=allergies)
     if _RECOMMEND_RE.search(t):
         return Extraction(intent="recommend", allergies=allergies)
     if allergies:
@@ -331,13 +349,13 @@ def extract_with_rules(text: str) -> Extraction:
     return Extraction(intent="unrelated")
  
  
-def _extract_raw(text: str, awaiting_confirmation: bool) -> Extraction:
+def extract(text: str, awaiting_confirmation: bool) -> Extraction:
     client = _get_client()
     if client is None:                       # no Groq key -> simple rules
         return extract_with_rules(text)
     # If Groq fails or returns bad JSON, an error is raised. safe() sends the user back to type again.
     resp = client.chat.completions.create(
-        model=GROQ_MODEL, temperature=0, max_tokens=150,
+        model=GROQ_MODEL, temperature=0, max_tokens=250,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": EXTRACT_PROMPT},
@@ -346,59 +364,43 @@ def _extract_raw(text: str, awaiting_confirmation: bool) -> Extraction:
         ],
     )
     ex = Extraction.model_validate_json(resp.choices[0].message.content)
-    if ex.dish:
-        ex.dish = _normalize_dish(ex.dish)
-    return ex
- 
- 
-def count_menu_dishes(text: str) -> int:
-    """How many different menu dishes are named in the text (used to catch several dishes in one message)."""
-    t = text.lower()
-    found = set()
-    for key in sorted(_LOOKUP, key=len, reverse=True):
-        pattern = r"\b" + re.escape(key) + r"s?\b"
-        if re.search(pattern, t):
-            found.add(_LOOKUP[key])
-            t = re.sub(pattern, " ", t)          # do not count a dish again inside its own long name
-    return len(found)
- 
- 
-def extract(text: str, awaiting_confirmation: bool) -> Extraction:
-    ex = _extract_raw(text, awaiting_confirmation)
-    if ex.intent == "order" and (ex.multiple or count_menu_dishes(text) >= 2):
-        ex.multiple = True
+    for it in ex.items:
+        if it.dish:
+            it.dish = _normalize_dish(it.dish)
     return ex
  
  
 TEMPLATES = {
     "unrelated": "I'm an AI agent for ordering food, not a general-purpose assistant, so I can't help with that. "
-                 "Please tell me one dish and how many you'd like. ({attempts_left} attempt(s) left)",
-    "incomplete": "I couldn't find both a dish and a quantity in that. "
-                  "Please tell me one dish and how many you'd like. ({attempts_left} attempt(s) left)",
-    "ask_partial": "Sorry, we don't have {required} {dish}. We can do {available}. Shall we proceed with {available}? "
-                   "Reply 'yes' to go ahead, or 'no' (or type a new order) to change it. ({attempts_left} attempt(s) left)",
-    "ask_last_chance": "Sorry, we don't have {required} {dish}. We can do {available}. This is your last attempt. "
-                       "Shall we proceed with {available}? (yes/no)",
-    "ask_not_available": "Sorry, {dish} is not available right now. {suggestions} ({attempts_left} attempt(s) left)",
+                 "Please tell me the dish(es) you'd like and how many of each. ({attempts_left} attempt(s) left)",
+    "incomplete": "I couldn't find a dish and quantity in that. "
+                  "Please tell me the dish(es) you'd like and how many of each. ({attempts_left} attempt(s) left)",
+    "ask_cart_issues": "Here's what I found: {issues}. Shall we proceed with what's available? Reply 'yes' to go "
+                       "ahead (unavailable items will be dropped), or 'no' (or a new order) to change it. "
+                       "({attempts_left} attempt(s) left)",
+    "ask_cart_issues_last": "Here's what I found: {issues}. This is your last attempt. Shall we proceed with "
+                            "what's available? (yes/no)",
+    "ask_cart_all_unavailable": "Sorry, none of the items you asked for are available right now. {suggestions} "
+                                "({attempts_left} attempt(s) left)",
     "recommend": "Here are some dishes I can suggest{note}: {dishes}. Tell me which one you'd like and how many.",
     "recommend_blocked": "I can't safely recommend dishes because I can't check {unverified} against our menu "
                          "information. Please ask our staff, or tell me a specific dish you'd like.",
     "recommend_none": "Sorry, I can't suggest any dish right now{reason}. "
                       "Please ask our staff, or tell me a specific dish you'd like.",
-    "ask_new_order": "Okay. What would you like to order instead? Please tell me one dish and how many.",
-    "complete": "Your order of {quantity} x {dish} is complete. Enjoy your meal!",
+    "ask_new_order": "Okay. What would you like to order instead? Please tell me the dish(es) and how many.",
+    "complete": "Your order of {cart} is complete. Enjoy your meal!",
     "apology_order": "Sorry, we can't serve you. We could not fulfil any of your requests after 3 attempts, "
                      "so I'm closing this order. Please visit again!",
     "apology_error": "I'm sorry, we are having technical problems, so I have to close this order. "
                      "Please try again later.",
-    "cook_failed_retry": "Sorry, cooking your {dish} did not go well. Don't worry, we are cooking it again.",
-    "serve_failed_retry": "Sorry, we could not serve your {dish}. We are cooking it again so it reaches you fresh.",
+    "cook_failed_retry": "Sorry, cooking {cart} did not go well. Don't worry, we are cooking it again.",
+    "serve_failed_retry": "Sorry, we could not serve {cart}. We are cooking it again so it reaches you fresh.",
     "error_retry": "Sorry, something went wrong on my side. Please type your order again.",
-    "apology_cook": "I'm sorry, the kitchen could not prepare your {dish} and we have no cooking attempts left. "
+    "apology_cook": "I'm sorry, the kitchen could not prepare {cart} and we have no cooking attempts left. "
                     "Your order is not completed.",
-    "apology_serve": "I'm sorry, we could not serve your {dish} after several tries. Your order is not completed.",
+    "apology_serve": "I'm sorry, we could not serve {cart} after several tries. Your order is not completed.",
 }
-WELCOME = "Welcome! I'm an AI agent for ordering food. Which dish would you like, and how many?"
+WELCOME = "Welcome! I'm an AI agent for ordering food. Which dish(es) would you like, and how many of each?"
  
 SPEAK_PROMPT = ("You are the voice of a restaurant order agent. Rewrite the message below as a short, friendly "
                 "reply (max 2 sentences). Keep every fact, number and option exactly as given. Add nothing new.")
@@ -413,7 +415,7 @@ def speak(kind: str, exact: bool = False, **facts) -> str:
         return text
     try:
         resp = client.chat.completions.create(
-            model=GROQ_MODEL, temperature=0.4, max_tokens=120,
+            model=GROQ_MODEL, temperature=0.4, max_tokens=150,
             messages=[{"role": "system", "content": SPEAK_PROMPT}, {"role": "user", "content": text}],
         )
         return resp.choices[0].message.content.strip() or text
@@ -447,6 +449,23 @@ def find_menu_key(dish: str) -> str | None:
         return _LOOKUP[d]
     close = difflib.get_close_matches(d, list(_LOOKUP), n=1, cutoff=0.85)   # small spelling mistakes
     return _LOOKUP[close[0]] if close else None
+ 
+ 
+# ------------------------------------------------------------------ cart helpers (NEW)
+def cart_text(items: list) -> str:
+    """'2 x butter chicken, 3 x garlic naan' -- used in every message that mentions the order."""
+    return ", ".join(f"{i['required_quantity']} x {i['dish_name']}" for i in items) or "your order"
+ 
+ 
+def _cart_issue_phrase(item: dict) -> str:
+    if item["status"] == "out":
+        return f"{item['dish_name']} is not available right now"
+    return f"we only have {item['available_quantity']} {item['dish_name']} (you wanted {item['required_quantity']})"
+ 
+ 
+def partial_reminder(items: list) -> str:
+    issues = "; ".join(_cart_issue_phrase(i) for i in items if i.get("status") != "ok")
+    return f"Back to your order: {issues}. Shall we proceed with what's available? (yes/no)"
  
  
 # ------------------------------------------------------------------ stock (saved in a file, restocked every 12 hours)
@@ -647,7 +666,8 @@ def extract_order(state: OrderState):
     if not text.strip():                             # empty message: ask again, no attempt used
         return {"messages": [say("I didn't get anything. Please type your order.")]}
     ex = extract(text, state["status"] == "PARTIAL")
-    log("extract_order", f"intent={ex.intent} dish={ex.dish} quantity={ex.quantity} allergies={ex.allergies}")
+    log("extract_order", f"intent={ex.intent} items={[(it.dish, it.quantity) for it in ex.items]} "
+                         f"allergies={ex.allergies}")
  
     # Allergies go into user_profile and stay there for the rest of the conversation
     old_profile = state["user_profile"]
@@ -663,20 +683,26 @@ def extract_order(state: OrderState):
     return result
  
  
-def partial_reminder(od: dict) -> str:
-    return f"Back to your order: shall we proceed with {od['available_quantity']} {od['dish_name']}? (yes/no)"
- 
- 
 def _decide_order(state: OrderState, ex: Extraction, profile: UserProfile, changed: bool):
-    """Decides: new order / confirm partial / reject / recommend / unrelated."""
+    """Decides: new order / confirm cart / reject / recommend / unrelated."""
     status, retries = state["status"], state["order_retries"]
     awaiting = status == "PARTIAL"
     od = dict(state["order_details"])
+    items = [dict(i) for i in od.get("items", [])]
  
-    # user agrees to the partial quantity
+    # user agrees to go ahead with what's available in the cart
     if ex.intent == "confirm" and awaiting:
-        od["required_quantity"] = od["available_quantity"]
-        return {"order_details": od, "status": "CONFIRMED"}
+        kept, dropped = [], []
+        for item in items:
+            if item.get("status") == "out":
+                dropped.append(item["dish_name"])
+                continue
+            if item.get("status") == "partial":
+                item["required_quantity"] = item["available_quantity"]
+            kept.append(item)
+        od["items"] = kept
+        msgs = [say(f"Note: {', '.join(dropped)} removed from your order -- out of stock.")] if dropped else []
+        return {"order_details": od, "status": "CONFIRMED", "messages": msgs}
  
     # asking for a recommendation, or just telling us about an allergy: never costs an attempt
     if ex.intent in ("recommend", "profile"):
@@ -686,31 +712,25 @@ def _decide_order(state: OrderState, ex: Extraction, profile: UserProfile, chang
         elif not changed:
             msgs.append(say("Got it, that is already noted."))
         if awaiting:
-            msgs.append(say(partial_reminder(od)))
-        return {"messages": msgs}
- 
-    # several dishes in one message: we take one dish per order for now (this does not cost an attempt)
-    if ex.intent == "order" and ex.multiple:
-        msgs = [say("I can take one dish per order for now. Please tell me one dish and how many you'd like. "
-                    "You can order the next dish after this one is done.")]
-        if awaiting:
-            msgs.append(say(partial_reminder(od)))
+            msgs.append(say(partial_reminder(items)))
         return {"messages": msgs}
  
     # attempts are used up: only 'confirm' could still continue
     if retries == 0:
         return {"status": "ORDER_RETRIES_EXHAUSTED"}
  
-    # user says no to a partial / not available answer -> ask for a new order (no extra attempt used)
+    # user says no to a partial / not available cart -> ask for a new order (no extra attempt used)
     if ex.intent == "reject" and status in ("PARTIAL", "NOT_AVAILABLE"):
-        return {"status": "AWAITING_ORDER", "messages": [say(speak("ask_new_order"))]}
+        return {"status": "AWAITING_ORDER", "order_details": {"items": []}, "messages": [say(speak("ask_new_order"))]}
  
-    # a usable order: one dish + quantity
-    if ex.intent == "order" and ex.dish and ex.quantity:
-        od.update(dish_name=ex.dish, required_quantity=ex.quantity, available_quantity=0)
+    # a usable order: at least one dish + quantity
+    valid_items = [it for it in ex.items if it.dish and it.quantity]
+    if ex.intent == "order" and valid_items:
+        od["items"] = [{"dish_name": it.dish, "required_quantity": it.quantity, "available_quantity": 0}
+                       for it in valid_items]
         return {"order_details": od, "status": "ORDER_RECEIVED"}
  
-    # unrelated, or dish/quantity missing: this costs one attempt
+    # unrelated, or no dish/quantity found: this costs one attempt
     retries -= 1
     if retries == 0:
         return {"order_retries": 0, "status": "ORDER_RETRIES_EXHAUSTED"}
@@ -720,41 +740,58 @@ def _decide_order(state: OrderState, ex: Extraction, profile: UserProfile, chang
  
 @safe
 def order_confirm(state: OrderState):
-    """Looks at the menu. Writes available_quantity and status: CONFIRMED / PARTIAL / NOT_AVAILABLE."""
+    """Looks at the menu for every item in the cart. Writes available_quantity + per-item status,
+    and an overall status: CONFIRMED (everything fully available) / PARTIAL (some adjustment needed) /
+    NOT_AVAILABLE (nothing in the cart is available at all)."""
     od = dict(state["order_details"])
-    key = find_menu_key(od["dish_name"])
-    available = available_stock(key) if key else 0     # dish not on menu -> 0
-    if key:
-        od["dish_name"] = key
-    od["available_quantity"] = available
+    items = [dict(i) for i in od.get("items", [])]
+    for item in items:
+        key = find_menu_key(item["dish_name"])
+        available = available_stock(key) if key else 0     # dish not on menu -> 0
+        if key:
+            item["dish_name"] = key
+        item["available_quantity"] = available
+        if available >= item["required_quantity"]:
+            item["status"] = "ok"
+        elif available > 0:
+            item["status"] = "partial"
+        else:
+            item["status"] = "out"
+    od["items"] = items
  
-    if available >= od["required_quantity"]:
-        status = "CONFIRMED"
-    elif available > 0:
-        status = "PARTIAL"
-    else:
+    statuses = [i["status"] for i in items]
+    if not statuses or all(s == "out" for s in statuses):
         status = "NOT_AVAILABLE"
+    elif all(s == "ok" for s in statuses):
+        status = "CONFIRMED"
+    else:
+        status = "PARTIAL"
  
     retries = state["order_retries"] - (0 if status == "CONFIRMED" else 1)
-    log("order_confirm", f"{od['dish_name']}: wanted {od['required_quantity']}, have {available} "
-                         f"-> {status} (order retries left: {retries})")
+    log("order_confirm", f"{cart_text(items)} -> {status} (order retries left: {retries})")
     return {"order_details": od, "status": status, "order_retries": retries}
  
  
 @safe
 def ask_user(state: OrderState):
-    """LLM tells the user what is wrong and what they can do."""
-    od, retries = state["order_details"], state["order_retries"]
+    """LLM tells the user what is wrong with the cart and what they can do."""
+    od = state["order_details"]
+    items = od["items"]
+    retries = state["order_retries"]
     profile = state["user_profile"]
-    facts = dict(dish=od["dish_name"], required=od["required_quantity"],
-                 available=od["available_quantity"], attempts_left=retries)
-    if state["status"] == "PARTIAL":
-        kind = "ask_last_chance" if retries == 0 else "ask_partial"
-    else:
-        kind = "ask_not_available"       # we also suggest other dishes - only ones that are safe for the customer
-        facts["suggestions"] = recommend_text(profile, limit=3, prefer_dish=od["dish_name"], exclude=(od["dish_name"],))
-    log("ask_user", kind)
     exact = bool(profile["allergies"] or profile["unverified"])       # allergy messages are never reworded by the LLM
+ 
+    if state["status"] == "NOT_AVAILABLE":
+        cart_names = tuple(i["dish_name"] for i in items)
+        suggestions = recommend_text(profile, limit=3, exclude=cart_names)
+        facts = dict(suggestions=suggestions, attempts_left=retries)
+        log("ask_user", "ask_cart_all_unavailable")
+        return {"messages": [say(speak("ask_cart_all_unavailable", exact=exact, **facts))]}
+ 
+    issues = "; ".join(_cart_issue_phrase(i) for i in items if i["status"] != "ok")
+    kind = "ask_cart_issues_last" if retries == 0 else "ask_cart_issues"
+    facts = dict(issues=issues, attempts_left=retries)
+    log("ask_user", kind)
     return {"messages": [say(speak(kind, exact=exact, **facts))]}
  
  
@@ -768,8 +805,7 @@ def cook(state: OrderState):
     log("cook", f"{'retry' if is_retry else 'first try'} -> {status} (cook retries left: {cook_retries})")
     update = {"status": status, "cook_retries": cook_retries}
     if not ok and cook_retries > 0:          # a retry will follow, so give the user feedback
-        dish = state["order_details"]["dish_name"]
-        update["messages"] = [say(speak("cook_failed_retry", dish=dish))]
+        update["messages"] = [say(speak("cook_failed_retry", cart=cart_text(state["order_details"]["items"])))]
     return update
  
  
@@ -783,17 +819,17 @@ def serve(state: OrderState):
     log("serve", f"-> SERVE_FAILED (serve retries left: {serve_retries})")
     update = {"status": "SERVE_FAILED", "serve_retries": serve_retries}
     if state["cook_retries"] > 0 and serve_retries > 0:   # we will cook again, so give the user feedback
-        dish = state["order_details"]["dish_name"]
-        update["messages"] = [say(speak("serve_failed_retry", dish=dish))]
+        update["messages"] = [say(speak("serve_failed_retry", cart=cart_text(state["order_details"]["items"])))]
     return update
  
  
 def finish_success(state: OrderState):
-    od = state["order_details"]
-    left = take_stock(od["dish_name"], od["required_quantity"])   # stock goes down only when the order completes
-    log("finish_success", f"order complete, {od['dish_name']} left in stock: {left}")
+    items = state["order_details"]["items"]
+    for item in items:
+        left = take_stock(item["dish_name"], item["required_quantity"])   # stock goes down only when the order completes
+        log("finish_success", f"{item['dish_name']} left in stock: {left}")
     return {"final_result": "COMPLETED",
-            "messages": [say(speak("complete", quantity=od["required_quantity"], dish=od["dish_name"]))]}
+            "messages": [say(speak("complete", cart=cart_text(items)))]}
  
  
 def failure_reason(state: OrderState) -> str:
@@ -812,13 +848,15 @@ def failure_reason(state: OrderState) -> str:
  
 def finish_failure(state: OrderState):
     reason = failure_reason(state)
+    items = state["order_details"]["items"]
     log("finish_failure", f"apology, reason = {reason} retries exhausted")
-    dish = state["order_details"]["dish_name"]
     return {"final_result": "NOT COMPLETED",
-            "messages": [say(speak(f"apology_{reason}", dish=dish))]}
+            "messages": [say(speak(f"apology_{reason}", cart=cart_text(items)))]}
  
  
 # ------------------------------------------------------------------ routing (reads status + counters)
+# NOTE: routing is unchanged by the multi-dish cart -- it only ever reads `status` / the retry counters,
+# never the dish(es) themselves, so none of the functions below needed to change.
 def error_route(state: OrderState):
     """Errors always go back to the user (or close the order after too many)."""
     if state["status"] == "TOO_MANY_ERRORS":
